@@ -305,6 +305,89 @@ r = cc.get(url, impersonate="chrome")
 
 ---
 
+## How other tools handle this
+
+Popular scraping tools hit the same Akamai wall. Out of the box, they get blocked for the same reason String does. Every one of them gets past it with the same layers this project uses.
+
+```mermaid
+flowchart TD
+    A(["Request to an<br/>Akamai-protected site"]) --> L1
+
+    subgraph L1 ["Layer 1: Normal HTTP client (gets blocked)"]
+        direction LR
+        S1["Scrapy default<br/>Twisted + OpenSSL"]
+        P1["Spider default<br/>Rust HTTP client"]
+        O1["String today / requests<br/>OpenSSL fingerprint"]
+    end
+
+    L1 -->|"403: not a browser fingerprint"| L2
+
+    subgraph L2 ["Layer 2: Browser fingerprint, fast"]
+        direction LR
+        S2["Scrapy + scrapy-impersonate<br/>uses curl_cffi"]
+        O2["This project<br/>curl_cffi, built now"]
+    end
+
+    L2 -->|"JavaScript challenge"| L3
+
+    subgraph L3 ["Layer 3: Real browser, slow"]
+        direction LR
+        S3["Scrapy + scrapy-playwright"]
+        P3["Spider chrome + chrome_stealth"]
+        O3["This project<br/>Tier 3, planned"]
+    end
+
+    L3 -.->|"or pay someone else"| L4
+
+    subgraph L4 ["Layer 4: Paid unblocker"]
+        direction LR
+        S4["Zyte API<br/>from the Scrapy team"]
+        P4["Spider Cloud<br/>proxies + stealth escalation"]
+        O4["This project<br/>not needed"]
+    end
+
+    classDef blocked fill:#F8E5E1,stroke:#B23B2A,color:#17202B
+    classDef fast fill:#E3F2E8,stroke:#2C7A4B,color:#17202B
+    classDef heavy fill:#EDE7F6,stroke:#5E35B1,color:#17202B
+    classDef paid fill:#FFF3D9,stroke:#9A6A12,color:#17202B
+    classDef ours fill:#E1EFF4,stroke:#0F6E8C,color:#17202B,stroke-width:3px
+    classDef start fill:#E1EFF4,stroke:#0F6E8C,color:#17202B
+    class A start
+    class S1,P1,O1 blocked
+    class S2 fast
+    class S3,P3 heavy
+    class S4,P4 paid
+    class O2,O3,O4 ours
+```
+
+### Scrapy
+
+- **Default: blocked.** Scrapy downloads pages through Twisted and OpenSSL, so its TLS fingerprint is OpenSSL's, not a browser's. Akamai catches it exactly like Python `requests`.
+- **Built-in settings don't fix it.** Changing `USER_AGENT` only changes a header. The retry middleware sends the same fingerprint again. AutoThrottle and proxies help with rate limits, but Akamai still reads the fingerprint.
+- **What Scrapy users add:**
+  - [`scrapy-impersonate`](https://pypi.org/project/scrapy-impersonate/) swaps Scrapy's download handler for **curl_cffi**, the same library this project uses. You pick the browser per request with `meta={"impersonate": "chrome"}`.
+  - `scrapy-playwright` renders pages in a real headless browser, for JavaScript challenges.
+  - **Zyte API** is a paid unblocking service from Zyte, the company behind Scrapy.
+
+### Spider (spider-rs / Spider Cloud)
+
+- **Default: blocked.** In plain HTTP mode, [Spider](https://docs.rs/crate/spider/) uses a regular Rust HTTP client, which doesn't have a browser fingerprint either.
+- **`chrome` + `chrome_stealth` features** drive a real headless Chrome and add stealth scripts (from the [`spider_fingerprint`](https://rust-digger.code-maven.com/crates/spider_fingerprint) crate) that hide bot signals. That matches this project's Tier 3.
+- **Spider Cloud (paid)** adds proxies, anti-bot handling, smart retries, browser switching and what it calls "automatic stealth escalation" ([source](https://spider.cloud/open-source-vs-cloud/)). It starts light and steps up when blocked, the same idea as the [fetch ladder](#the-future-fetch-ladder) above.
+
+### Side by side
+
+| Layer | Scrapy | Spider | This project |
+|---|---|---|---|
+| 1. Normal client (blocked) | Twisted + OpenSSL | Rust HTTP client | `requests` (Step 2 of the approach) |
+| 2. Browser fingerprint, fast | `scrapy-impersonate` (curl_cffi) | — | **curl_cffi, built now** |
+| 3. Real browser, slow | `scrapy-playwright` | `chrome` + `chrome_stealth` | Tier 3, planned |
+| 4. Paid unblocker | Zyte API | Spider Cloud | Not needed |
+
+**The takeaway:** this is the industry's standard way to get past Akamai, not a one-off hack. Scrapy's own fix for it is built on curl_cffi, and Spider Cloud's paid service escalates from light to heavy the same way this plan does. The difference is that String keeps it in-house instead of paying another scraping vendor for its core product.
+
+---
+
 ## Run it yourself
 
 ```bash
