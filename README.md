@@ -203,6 +203,42 @@ With `format=json` you get:
 
 ## My approach
 
+How I got from "String fails on these sites" to a working fix:
+
+```mermaid
+flowchart TD
+    S(["Problem<br/>String fails on Ajio, Nykaa, 99acres"]) --> R["Step 1: Reproduce<br/>send real links through String's API<br/>save the request IDs"]
+    R --> Q1["Step 2a: Plain Python requests"]
+    Q1 --> X1["403 Forbidden"]
+    X1 --> Q2["Step 2b: Same request with<br/>real browser headers + User-Agent"]
+    Q2 --> X2["Still 403 Forbidden"]
+    X2 --> C["Conclusion<br/>Akamai blocks on the TLS / HTTP/2<br/>fingerprint, not the headers"]
+    C --> O{"Step 3: How do we<br/>look like a real browser?"}
+    O --> O1["Headless browser<br/>works, but heavy and slow<br/>kept for later"]
+    O --> O2["Paid scraping API or proxies<br/>costs per page, adds a vendor<br/>rejected"]
+    O --> O3["curl_cffi<br/>real browser fingerprint<br/>fast and light<br/>CHOSEN"]
+    O3 --> T["Step 4: Test browser profiles<br/>on the real sites<br/>chrome, safari, chrome131"]
+    T --> W{"Full page<br/>comes back?"}
+    W -- Yes --> F["Step 5: Add safety<br/>profile fallback, block detection,<br/>host allowlist, timeouts"]
+    F --> D["Step 6: Deploy<br/>GitHub to Render"]
+    D --> I(["Step 7: Plug into<br/>String's /v1/fetch"])
+    W -.->|"No: JS challenge"| L["Future Tier 3<br/>headless browser + cookie reuse"]
+    O1 -.-> L
+
+    classDef start fill:#E1EFF4,stroke:#0F6E8C,color:#17202B
+    classDef step fill:#FFFFFF,stroke:#0F6E8C,color:#17202B
+    classDef check fill:#FFF3D9,stroke:#9A6A12,color:#17202B
+    classDef good fill:#E3F2E8,stroke:#2C7A4B,color:#17202B
+    classDef stop fill:#F8E5E1,stroke:#B23B2A,color:#17202B
+    classDef off fill:#F1F3F5,stroke:#8A96A6,color:#5A6675,stroke-dasharray:5 4
+    class S,I start
+    class R,Q1,Q2,C,T,F,D step
+    class O,W check
+    class O3 good
+    class X1,X2 stop
+    class O1,O2,L off
+```
+
 1. **Reproduced the failure.** Sent real Ajio and Nykaa links through String's API with `get_request_ids.py` and saved each request ID, so String's team can trace the exact failed requests in their logs.
 2. **Found the layer it fails at.** A plain Python request gets a `403` before any page logic runs, and changing headers doesn't fix it. That points to Akamai blocking on the TLS / HTTP/2 fingerprint, not on the URL or rate.
 3. **Matched the fingerprint instead of fighting the check.** Used `curl_cffi` to send a real Chrome / Safari `ClientHello` and HTTP/2 settings. No headless browser, no captcha solving, so each request stays fast and light.
@@ -210,6 +246,62 @@ With `format=json` you get:
 5. **Locked it down.** Only `https` URLs on the 3 Akamai hosts are accepted, so the service can't be used as an open proxy.
 6. **Made it easy to plug in.** One HTTP endpoint that returns plain HTML, so String's existing markdown step works on it without changes.
 7. **Deployed it.** Code on GitHub, running on Render from `render.yaml`.
+
+---
+
+## Why curl_cffi?
+
+### What it is
+
+`curl_cffi` is a Python library that lets Python use **curl-impersonate**, a special build of the well-known `curl` tool.
+
+- **curl-impersonate** is curl rebuilt with **BoringSSL**, the same TLS library that runs inside Chrome. It also uses the same HTTP/2 settings, TLS extension order and header order as the real browser.
+- **cffi** (C Foreign Function Interface) is the bridge that lets Python call that C library directly, so we get browser-grade networking from normal Python code.
+- `impersonate="chrome"` picks which browser to copy. There are profiles for Chrome, Safari, Edge and more.
+
+```mermaid
+flowchart LR
+    P["Our Python code<br/>cc.get(url, impersonate=chrome)"] --> F["cffi bridge<br/>Python calls C directly"]
+    F --> CI["curl-impersonate<br/>patched curl"]
+    CI --> BS["BoringSSL<br/>Chrome's own TLS library<br/>same ClientHello"]
+    CI --> H2["HTTP/2 layer<br/>Chrome's SETTINGS,<br/>window size, header order"]
+    BS --> A(["Akamai sees<br/>a real Chrome"])
+    H2 --> A
+
+    classDef step fill:#FFFFFF,stroke:#0F6E8C,color:#17202B
+    classDef start fill:#E1EFF4,stroke:#0F6E8C,color:#17202B
+    classDef good fill:#E3F2E8,stroke:#2C7A4B,color:#17202B
+    class P start
+    class F,CI,BS,H2 step
+    class A good
+```
+
+### Why not something else?
+
+| Option | Passes Akamai's fingerprint check? | Speed | Cost to run | Verdict |
+|---|---|---|---|---|
+| Python `requests` / `httpx` | No. OpenSSL's fingerprint isn't a browser's. | Fast | Free | Blocked with 403 |
+| `requests` + fake browser headers | No. Headers change, the TLS handshake doesn't. | Fast | Free | Still 403 |
+| Headless browser (Playwright, Selenium) | Yes, and it can pass the JavaScript challenge too | Slow: seconds per page | High: a full Chrome per request, hundreds of MB of memory | Overkill for most requests. Kept as the future Tier 3. |
+| Paid scraping API / residential proxies | Usually | Medium | Pay per request | String *is* a web access API. Depending on another vendor for its core product adds cost and risk. |
+| Captcha-solving services | Doesn't fix the cause | Slow | Pay per captcha | Treats the symptom, not the cause |
+| **`curl_cffi`** | **Yes, for TLS / HTTP/2 fingerprint checks** | **Fast, like plain `requests`** | **Free, open source** | **Chosen.** Can't run JavaScript, which the Tier 3 plan covers. |
+
+### It's almost a one-line change
+
+`curl_cffi` copies the `requests` API, so moving over is easy for String's engineers:
+
+```python
+# Blocked by Akamai (403)
+import requests
+r = requests.get(url)
+
+# Gets through: same call, real Chrome fingerprint
+from curl_cffi import requests as cc
+r = cc.get(url, impersonate="chrome")
+```
+
+**In short:** it fixes the exact thing Akamai checks (the fingerprint), at the speed and cost of a normal HTTP request, with code String's team already knows how to write.
 
 ---
 
