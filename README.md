@@ -227,8 +227,110 @@ http://localhost:8000/fetch?url=https://www.ajio.com/men-tshirts/c/830216014
 http://localhost:8000/fetch?url=https://www.ajio.com/men-tshirts/c/830216014&format=json
 ```
 
-## Known limits
+---
 
-- **JavaScript challenges:** if Akamai escalates to its JavaScript sensor check (the `_abck` cookie flow), a fingerprint alone can't pass it, because curl_cffi doesn't run JavaScript. The service detects this and returns `502` instead of bad data.
-- **Fingerprints age:** Akamai updates its list of known browsers. Profiles may need bumping (for example `chrome131` to a newer Chrome) when `curl_cffi` releases new ones.
-- **Free hosting:** Render's free plan sleeps when idle, so the first call after a break is slow. For real customer traffic, String would run this on its own servers.
+## Known limits and how we'll handle them
+
+This is a working first version. These are the gaps I know about, and the plan for each one.
+
+| # | Limit | What happens today | How we'll handle it |
+|---|---|---|---|
+| 1 | **Akamai JavaScript challenge** (the `_abck` / `bm_sz` sensor cookies) | curl_cffi can't run JavaScript, so a page that needs the sensor check comes back blocked. The service returns `502` instead of bad data. | Add a **real-browser tier**: only when the fast tier is blocked, open the page once in headless Chrome (Playwright), let it pass the JS check, then **save the Akamai cookies** it earned. Later requests reuse those cookies through the fast curl_cffi path until they expire. |
+| 2 | **Browser fingerprints get old** | Akamai keeps updating its list of known browsers. An old profile like `chrome131` slowly stops working. | **Daily health check** with GitHub Actions: hit each site with each profile and record what works. Keep `curl_cffi` updated with Dependabot so new Chrome / Safari profiles arrive automatically. Move the profile list into config, and try the profile with the best recent success rate first. |
+| 3 | **Retry bug:** a timeout or network error on the first profile stops the whole request | A `502` comes back straight away, without trying Safari or the newer Chrome. | Catch errors **per profile** so every profile gets its turn. Return the reason for each failed attempt in the JSON response. |
+| 4 | **IP reputation and rate limits** | All traffic comes from one Render server IP in Singapore. A lot of traffic from one datacenter IP can trigger Akamai's `429` or extra checks. | **Per-site rate limits** and **short-term caching** of pages that were just fetched, so we don't hit the same page again and again. Run from String's own servers in India. Only if real traffic needs it, add a small pool of good-quality IPs. |
+| 5 | **The host list is hard-coded** | Only Ajio, Nykaa and 99acres work. Adding a site means changing code. | Move the allowlist into config. Later, **auto-detect Akamai**: if String's normal fetch gets a `403` with `Server: AkamaiGHost` or an `_abck` cookie, send that request to the fetcher automatically. |
+| 6 | **No login on the endpoint** | Anyone with the link can call it, though only for the 3 allowed sites. | Require an **API key header** shared only with String. Reject every other call with `401`. |
+| 7 | **No monitoring** | If success drops, nobody finds out until a customer complains. | **Structured logs and metrics** per site and per profile: success rate, time taken, which profile won. Add a `/healthz` endpoint and an alert when success drops. |
+| 8 | **Free hosting sleeps** | Render's free plan sleeps when idle, so the first call after a break is slow. | Ship it as a **Docker image** that String runs on its own always-on servers. No cold starts, and it sits right next to String's fetcher. |
+
+### The future fetch ladder
+
+The plan for limits 1 and 2: always try the cheapest, fastest way first, and use the heavy real browser only when needed.
+
+```mermaid
+flowchart TD
+    A(["Request for an Akamai site"]) --> C{"Fresh page<br/>in the cache?"}
+    C -- Yes --> OK(["Return the page"])
+    C -- No --> T1["Tier 1: curl_cffi<br/>browser fingerprint<br/>+ saved Akamai cookies if we have them<br/>fast and cheap"]
+    T1 --> B1{"Blocked?"}
+    B1 -- No --> OK
+    B1 -- Yes --> T2["Tier 2: next curl_cffi profile<br/>safari, then newer chrome"]
+    T2 --> B2{"Blocked?"}
+    B2 -- No --> OK
+    B2 -- "Yes: JS challenge" --> T3["Tier 3: headless Chrome<br/>passes the Akamai JS check<br/>slow, used rarely"]
+    T3 --> K["Save the _abck / bm_sz cookies<br/>for Tier 1 to reuse"]
+    K --> OK
+    T3 -.->|"still blocked"| F["502 with the reason<br/>alert if this keeps happening"]
+
+    classDef start fill:#E1EFF4,stroke:#0F6E8C,color:#17202B
+    classDef step fill:#FFFFFF,stroke:#0F6E8C,color:#17202B
+    classDef heavy fill:#EDE7F6,stroke:#5E35B1,color:#17202B
+    classDef check fill:#FFF3D9,stroke:#9A6A12,color:#17202B
+    classDef good fill:#E3F2E8,stroke:#2C7A4B,color:#17202B
+    classDef stop fill:#F8E5E1,stroke:#B23B2A,color:#17202B
+    class A start
+    class T1,T2,K step
+    class T3 heavy
+    class C,B1,B2 check
+    class OK good
+    class F stop
+```
+
+Most requests should stop at Tier 1, so the average request stays fast and cheap. Tier 3 only runs when Akamai asks for the JavaScript check, and the cookies it saves keep the next requests on the fast path.
+
+---
+
+## Future plan
+
+```mermaid
+flowchart LR
+    P1["Phase 1<br/>Harden<br/>retry fix, API key,<br/>logs, /healthz"] --> P2["Phase 2<br/>Plug into String<br/>Docker image, routing rule<br/>in /v1/fetch"]
+    P2 --> P3["Phase 3<br/>Self-healing<br/>daily health check,<br/>auto profile order, alerts"]
+    P3 --> P4["Phase 4<br/>Beat JS challenges<br/>headless Chrome tier,<br/>cookie reuse, caching"]
+    P4 --> P5["Phase 5<br/>More sites<br/>auto-detect Akamai,<br/>config-based allowlist"]
+
+    classDef now fill:#E1EFF4,stroke:#0F6E8C,color:#17202B
+    classDef next fill:#FFFFFF,stroke:#0F6E8C,color:#17202B
+    classDef later fill:#E3F2E8,stroke:#2C7A4B,color:#17202B
+    class P1 now
+    class P2,P3 next
+    class P4,P5 later
+```
+
+### Phase 1: Harden what exists
+- Fix the retry bug so a timeout on one profile moves on to the next.
+- Add an API key header so only String can call the service.
+- Add structured logs (site, profile, status, time taken) and a `/healthz` endpoint.
+- Add tests for block detection and the host allowlist.
+
+### Phase 2: Plug into String
+- Package the service as a Docker image that runs on String's servers.
+- Add the routing rule in String's `/v1/fetch`: Akamai hosts go to the fetcher, and the HTML goes through String's existing markdown step.
+- Run it next to the current fetcher on a share of traffic first, compare success rates, then switch over fully.
+
+### Phase 3: Make it self-healing
+- A daily GitHub Actions job that fetches a test page from each site with each profile.
+- Automatic profile ordering: the profile that worked most recently goes first.
+- Alerts when a site's success rate drops, and Dependabot updates for `curl_cffi`.
+
+### Phase 4: Handle Akamai's JavaScript challenge
+- Add the headless Chrome tier, used only when the fast tiers are blocked.
+- Save and reuse the Akamai cookies (`_abck`, `bm_sz`) so most requests stay on the fast path.
+- Cache freshly fetched pages for a short time to cut repeat load on the sites.
+
+### Phase 5: Cover more sites
+- Move the allowlist into config so adding a site needs no code change.
+- Auto-detect Akamai blocks in String's normal fetcher (`Server: AkamaiGHost`, `_abck` cookie) and route those requests here automatically.
+- Use the same ladder for other bot-protection vendors when String hits them.
+
+### What we'll measure
+
+| Metric | Why it matters |
+|---|---|
+| Success rate per site | The main number: how often String gets the real page. |
+| Time taken (median and slowest 5%) | Customers feel this. It shows when the slow Tier 3 is running too often. |
+| Which tier / profile won | Shows when a fingerprint is getting old, before it fully breaks. |
+| Tier 3 usage | The heavy browser costs the most, so this should stay low. |
+
+Targets for each metric will be agreed with String once Phase 2 is running on real traffic.
